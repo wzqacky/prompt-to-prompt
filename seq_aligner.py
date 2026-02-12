@@ -11,56 +11,72 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""
+Sequence alignment utilities for Prompt-to-Prompt.
+
+Updated to support configurable max_len for different tokenizers:
+- CLIP: max_len=77
+- T5: max_len=512
+"""
+
 import torch
 import numpy as np
+from typing import Tuple, List, Optional
+
+
+# Default max lengths for different tokenizers
+MAX_LEN_CLIP = 77
+MAX_LEN_T5 = 512
 
 
 class ScoreParams:
+    """Scoring parameters for sequence alignment."""
 
-    def __init__(self, gap, match, mismatch):
+    def __init__(self, gap: int, match: int, mismatch: int):
         self.gap = gap
         self.match = match
         self.mismatch = mismatch
 
-    def mis_match_char(self, x, y):
+    def mis_match_char(self, x, y) -> int:
         if x != y:
             return self.mismatch
         else:
             return self.match
-        
-    
-def get_matrix(size_x, size_y, gap):
-    matrix = []
-    for i in range(len(size_x) + 1):
-        sub_matrix = []
-        for j in range(len(size_y) + 1):
-            sub_matrix.append(0)
-        matrix.append(sub_matrix)
-    for j in range(1, len(size_y) + 1):
-        matrix[0][j] = j*gap
-    for i in range(1, len(size_x) + 1):
-        matrix[i][0] = i*gap
-    return matrix
 
 
-def get_matrix(size_x, size_y, gap):
+def get_matrix(size_x: int, size_y: int, gap: int) -> np.ndarray:
+    """Create alignment scoring matrix."""
     matrix = np.zeros((size_x + 1, size_y + 1), dtype=np.int32)
     matrix[0, 1:] = (np.arange(size_y) + 1) * gap
     matrix[1:, 0] = (np.arange(size_x) + 1) * gap
     return matrix
 
 
-def get_traceback_matrix(size_x, size_y):
-    matrix = np.zeros((size_x + 1, size_y +1), dtype=np.int32)
+def get_traceback_matrix(size_x: int, size_y: int) -> np.ndarray:
+    """Create traceback matrix for alignment."""
+    matrix = np.zeros((size_x + 1, size_y + 1), dtype=np.int32)
     matrix[0, 1:] = 1
     matrix[1:, 0] = 2
     matrix[0, 0] = 4
     return matrix
 
 
-def global_align(x, y, score):
+def global_align(x: List, y: List, score: ScoreParams) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Perform global sequence alignment using Needleman-Wunsch algorithm.
+    
+    Args:
+        x: First sequence
+        y: Second sequence
+        score: Scoring parameters
+        
+    Returns:
+        Tuple of (score matrix, traceback matrix)
+    """
     matrix = get_matrix(len(x), len(y), score.gap)
     trace_back = get_traceback_matrix(len(x), len(y))
+    
     for i in range(1, len(x) + 1):
         for j in range(1, len(y) + 1):
             left = matrix[i, j - 1] + score.gap
@@ -73,67 +89,144 @@ def global_align(x, y, score):
                 trace_back[i, j] = 2
             else:
                 trace_back[i, j] = 3
+    
     return matrix, trace_back
 
 
-def get_aligned_sequences(x, y, trace_back):
+def get_aligned_sequences(
+    x: List, 
+    y: List, 
+    trace_back: np.ndarray
+) -> Tuple[List, List, torch.Tensor]:
+    """
+    Get aligned sequences from traceback matrix.
+    
+    Returns:
+        Tuple of (aligned x, aligned y, mapper tensor)
+    """
     x_seq = []
     y_seq = []
     i = len(x)
     j = len(y)
     mapper_y_to_x = []
+    
     while i > 0 or j > 0:
         if trace_back[i, j] == 3:
             x_seq.append(x[i-1])
             y_seq.append(y[j-1])
-            i = i-1
-            j = j-1
+            i = i - 1
+            j = j - 1
             mapper_y_to_x.append((j, i))
         elif trace_back[i][j] == 1:
             x_seq.append('-')
             y_seq.append(y[j-1])
-            j = j-1
+            j = j - 1
             mapper_y_to_x.append((j, -1))
         elif trace_back[i][j] == 2:
             x_seq.append(x[i-1])
             y_seq.append('-')
-            i = i-1
+            i = i - 1
         elif trace_back[i][j] == 4:
             break
+    
     mapper_y_to_x.reverse()
     return x_seq, y_seq, torch.tensor(mapper_y_to_x, dtype=torch.int64)
 
 
-def get_mapper(x: str, y: str, tokenizer, max_len=77):
+def get_mapper(
+    x: str, 
+    y: str, 
+    tokenizer, 
+    max_len: Optional[int] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Get token mapper between two prompts.
+    
+    Args:
+        x: Source prompt
+        y: Target prompt
+        tokenizer: Tokenizer instance
+        max_len: Maximum sequence length. If None, uses tokenizer.model_max_length
+                 or defaults to 77 (CLIP) for backwards compatibility.
+    
+    Returns:
+        Tuple of (mapper tensor, alphas tensor)
+    """
+    if max_len is None:
+        max_len = getattr(tokenizer, 'model_max_length', MAX_LEN_CLIP)
+    
     x_seq = tokenizer.encode(x)
     y_seq = tokenizer.encode(y)
+    
     score = ScoreParams(0, 1, -1)
     matrix, trace_back = global_align(x_seq, y_seq, score)
     mapper_base = get_aligned_sequences(x_seq, y_seq, trace_back)[-1]
+    
     alphas = torch.ones(max_len)
-    alphas[: mapper_base.shape[0]] = mapper_base[:, 1].ne(-1).float()
+    alphas[:mapper_base.shape[0]] = mapper_base[:, 1].ne(-1).float()
+    
     mapper = torch.zeros(max_len, dtype=torch.int64)
     mapper[:mapper_base.shape[0]] = mapper_base[:, 1]
     mapper[mapper_base.shape[0]:] = len(y_seq) + torch.arange(max_len - len(y_seq))
+    
     return mapper, alphas
 
 
-def get_refinement_mapper(prompts, tokenizer, max_len=77):
+def get_refinement_mapper(
+    prompts: List[str], 
+    tokenizer, 
+    max_len: Optional[int] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Get refinement mapper for prompt editing.
+    
+    Used when adding/modifying words in prompts.
+    
+    Args:
+        prompts: List of prompts (first is source, rest are targets)
+        tokenizer: Tokenizer instance
+        max_len: Maximum sequence length
+        
+    Returns:
+        Tuple of (stacked mappers, stacked alphas)
+    """
+    if max_len is None:
+        max_len = getattr(tokenizer, 'model_max_length', MAX_LEN_CLIP)
+    
     x_seq = prompts[0]
     mappers, alphas = [], []
+    
     for i in range(1, len(prompts)):
         mapper, alpha = get_mapper(x_seq, prompts[i], tokenizer, max_len)
         mappers.append(mapper)
         alphas.append(alpha)
+    
     return torch.stack(mappers), torch.stack(alphas)
 
 
-def get_word_inds(text: str, word_place: int, tokenizer):
+def get_word_inds(
+    text: str, 
+    word_place: int, 
+    tokenizer
+) -> np.ndarray:
+    """
+    Get token indices for a word position in text.
+    
+    Args:
+        text: Input text
+        word_place: Word index or word string
+        tokenizer: Tokenizer instance
+        
+    Returns:
+        Array of token indices
+    """
     split_text = text.split(" ")
+    
     if type(word_place) is str:
         word_place = [i for i, word in enumerate(split_text) if word_place == word]
     elif type(word_place) is int:
         word_place = [word_place]
+    
     out = []
     if len(word_place) > 0:
         words_encode = [tokenizer.decode([item]).strip("#") for item in tokenizer.encode(text)][1:-1]
@@ -146,23 +239,50 @@ def get_word_inds(text: str, word_place: int, tokenizer):
             if cur_len >= len(split_text[ptr]):
                 ptr += 1
                 cur_len = 0
+    
     return np.array(out)
 
 
-def get_replacement_mapper_(x: str, y: str, tokenizer, max_len=77):
+def get_replacement_mapper_(
+    x: str, 
+    y: str, 
+    tokenizer, 
+    max_len: Optional[int] = None
+) -> torch.Tensor:
+    """
+    Get replacement mapper for word swap.
+    
+    Args:
+        x: Source prompt
+        y: Target prompt
+        tokenizer: Tokenizer instance
+        max_len: Maximum sequence length
+        
+    Returns:
+        Replacement mapper tensor
+    """
+    if max_len is None:
+        max_len = getattr(tokenizer, 'model_max_length', MAX_LEN_CLIP)
+    
     words_x = x.split(' ')
     words_y = y.split(' ')
+    
     if len(words_x) != len(words_y):
-        raise ValueError(f"attention replacement edit can only be applied on prompts with the same length"
-                         f" but prompt A has {len(words_x)} words and prompt B has {len(words_y)} words.")
+        raise ValueError(
+            f"Attention replacement edit can only be applied on prompts with the same length "
+            f"but prompt A has {len(words_x)} words and prompt B has {len(words_y)} words."
+        )
+    
     inds_replace = [i for i in range(len(words_y)) if words_y[i] != words_x[i]]
     inds_source = [get_word_inds(x, i, tokenizer) for i in inds_replace]
     inds_target = [get_word_inds(y, i, tokenizer) for i in inds_replace]
+    
     mapper = np.zeros((max_len, max_len))
     i = j = 0
     cur_inds = 0
+    
     while i < max_len and j < max_len:
-        if cur_inds < len(inds_source) and inds_source[cur_inds][0] == i:
+        if cur_inds < len(inds_source) and len(inds_source[cur_inds]) > 0 and inds_source[cur_inds][0] == i:
             inds_source_, inds_target_ = inds_source[cur_inds], inds_target[cur_inds]
             if len(inds_source_) == len(inds_target_):
                 mapper[inds_source_, inds_target_] = 1
@@ -185,12 +305,30 @@ def get_replacement_mapper_(x: str, y: str, tokenizer, max_len=77):
     return torch.from_numpy(mapper).float()
 
 
-
-def get_replacement_mapper(prompts, tokenizer, max_len=77):
+def get_replacement_mapper(
+    prompts: List[str], 
+    tokenizer, 
+    max_len: Optional[int] = None
+) -> torch.Tensor:
+    """
+    Get replacement mapper for word swap across multiple prompts.
+    
+    Args:
+        prompts: List of prompts (first is source, rest are targets)
+        tokenizer: Tokenizer instance
+        max_len: Maximum sequence length
+        
+    Returns:
+        Stacked replacement mappers
+    """
+    if max_len is None:
+        max_len = getattr(tokenizer, 'model_max_length', MAX_LEN_CLIP)
+    
     x_seq = prompts[0]
     mappers = []
+    
     for i in range(1, len(prompts)):
         mapper = get_replacement_mapper_(x_seq, prompts[i], tokenizer, max_len)
         mappers.append(mapper)
+    
     return torch.stack(mappers)
-

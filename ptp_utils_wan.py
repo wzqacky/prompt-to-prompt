@@ -182,13 +182,14 @@ class P2PWanAttnProcessor:
         return hidden_states
 
 
-def register_attention_control_wan(model, controller):
+def register_attention_control_wan(model, controller, cross_only: bool = True):
     """
     Register P2P attention processors for Wan2.1 DiT transformer.
 
     Args:
         model: WanPipeline instance
         controller: AttentionControl instance
+        cross_only: When True (default), only hook cross-attention layers to save memory
 
     Returns:
         int: Number of attention layers registered
@@ -218,8 +219,8 @@ def register_attention_control_wan(model, controller):
     att_count = 0
 
     for idx, block in enumerate(blocks):
-        # Self-attention (attn1)
-        if hasattr(block, 'attn1') and block.attn1 is not None:
+        # Self-attention (attn1) — skip by default to keep flash attention
+        if not cross_only and hasattr(block, 'attn1') and block.attn1 is not None:
             model._ptp_original_processors[(idx, 'attn1')] = block.attn1.processor
             block.attn1.processor = P2PWanAttnProcessor(controller, idx, "self")
             att_count += 1
@@ -231,7 +232,8 @@ def register_attention_control_wan(model, controller):
             att_count += 1
 
     controller.num_att_layers = att_count
-    print(f"Registered {att_count} attention layers for P2P control")
+    print(f"Registered {att_count} attention layers for P2P control"
+          f" (cross_only={cross_only})")
 
     return att_count
 

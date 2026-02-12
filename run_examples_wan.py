@@ -175,14 +175,14 @@ def example_replacement(model, tokenizer, device, args):
     )
     save_outputs(videos, prompts_animal, "replace_cat_dog", args.output_dir, tokenizer)
 
-    # --- Swap with LocalBlend: garden -> beach ---
+    # --- Swap with LocalBlend: cat => dog ---
     prompts_scene = [
         "A cat walking in the garden",
-        "A cat walking on the beach",
+        "A dog walking in the garden",
     ]
     lb = ptp_wan.LocalBlendWan(
         prompts_scene,
-        words=[["garden"], ["beach"]],
+        words=[["cat"], ["dog"]],
         tokenizer=tokenizer,
         device=device,
     )
@@ -205,7 +205,7 @@ def example_replacement(model, tokenizer, device, args):
         width=args.width,
         offload=args.offload,
     )
-    save_outputs(videos, prompts_scene, "replace_garden_beach", args.output_dir, tokenizer)
+    save_outputs(videos, prompts_scene, "replace_cat_dog_lb", args.output_dir, tokenizer)
     print("Replacement example done.\n")
 
 

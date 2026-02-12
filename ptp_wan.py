@@ -264,13 +264,15 @@ class AttentionStoreWan(AttentionControlWan):
         self.step_store = self.get_empty_store()
         self.attention_store = {}
 
-    def __init__(self, low_resource: bool = False, max_store_size: int = 4096):
+    def __init__(self, low_resource: bool = False, max_store_size: int = 8192):
         """
         Initialize attention store.
 
         Args:
             low_resource: Whether to use low resource mode
             max_store_size: Maximum sequence length to store (to avoid OOM)
+                TODO: Need to adjust this/ remove this 
+                8192 is a predefinded constant for 17x480x832 videos (8192=5*60*104//4)
         """
         super().__init__(low_resource)
         self.step_store = self.get_empty_store()
@@ -577,11 +579,11 @@ class LocalBlendWan:
             return x_t
 
         # Select middle blocks (most semantic)
+        # TODO: Experiment with the selection strategy
         num_maps = len(maps)
         start_idx = num_maps // 3
         end_idx = 2 * num_maps // 3
         maps = maps[start_idx:end_idx]
-
         if len(maps) == 0:
             return x_t
 
@@ -668,6 +670,7 @@ class LocalBlendWan:
         alpha_layers = torch.zeros(len(prompts), 1, 1, 1, max_num_words)
 
         for i, (prompt, words_) in enumerate(zip(prompts, words)):
+            print(f"Local Blending on words: {words_}")
             if isinstance(words_, str):
                 words_ = [words_]
             for word in words_:

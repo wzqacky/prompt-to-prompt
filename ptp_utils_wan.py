@@ -487,18 +487,15 @@ def latent2video(vae, latents: torch.Tensor) -> np.ndarray:
 
 def export_video(frames: np.ndarray, path: str, fps: int = 15):
     """Export video frames to file."""
-    try:
-        from diffusers.utils import export_to_video
-        if frames.ndim == 5:
-            frames = frames[0]
-        export_to_video(frames, path, fps=fps)
-        print(f"Video saved to: {path}")
-    except ImportError:
-        import imageio
-        if frames.ndim == 5:
-            frames = frames[0]
-        imageio.mimwrite(path, frames, fps=fps)
-        print(f"Video saved to: {path}")
+    import imageio
+    if frames.ndim == 5:
+        frames = frames[0]
+
+    with imageio.get_writer(path, fps=fps, quality=5, bitrate=None, macro_block_size=16) as writer:
+        for frame in frames:
+            writer.append_data(frame)
+
+    print(f"Video saved to: {path}")
 
 
 def view_video_frames(frames: np.ndarray, num_display: int = 8, save_path: Optional[str] = None):

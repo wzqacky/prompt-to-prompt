@@ -33,9 +33,13 @@ import numpy as np
 import abc
 from PIL import Image
 import matplotlib.pyplot as plt
+from diffusers import WanPipeline, AutoencoderKLWan
 
-import ptp_utils_wan
-import seq_aligner
+from ptp_utils_wan import (
+    text2video_wan, view_video_frames,
+    get_word_inds_t5, get_time_words_attention_alpha_t5, get_device
+)
+from seq_aligner import get_replacement_mapper, get_refinement_mapper
 
 
 # ============================================================================
@@ -71,10 +75,8 @@ def load_wan_model(
     Returns:
         Tuple of (pipeline, tokenizer, device)
     """
-    from diffusers import WanPipeline, AutoencoderKLWan
-
     if device is None:
-        device = ptp_utils_wan.get_device()
+        device = get_device()
 
     print(f"Loading Wan2.1 model from {model_id}...")
 
@@ -272,7 +274,7 @@ class AttentionStoreWan(AttentionControlWan):
             low_resource: Whether to use low resource mode
             max_store_size: Maximum sequence length to store (to avoid OOM)
                 TODO: Need to adjust this/ remove this 
-                8192 is a predefinded constant for 17x480x832 videos (8192=5*60*104//4)
+                8192 is a predefinded constant for 17x480x832 videos (5*60*104//4=7800 < 8192)
         """
         super().__init__(low_resource)
         self.step_store = self.get_empty_store()
@@ -376,7 +378,7 @@ class AttentionControlEditWan(AttentionStoreWan, abc.ABC):
         self.batch_size = len(prompts)
 
         # Compute cross-attention replacement schedule
-        self.cross_replace_alpha = ptp_utils_wan.get_time_words_attention_alpha_t5(
+        self.cross_replace_alpha = get_time_words_attention_alpha_t5(
             prompts, num_steps, cross_replace_steps, tokenizer, max_num_words
         ).to(device)
 
@@ -428,7 +430,7 @@ class AttentionReplaceWan(AttentionControlEditWan):
             prompts, num_steps, cross_replace_steps, self_replace_steps,
             local_blend, tokenizer, device, low_resource
         )
-        self.mapper = seq_aligner.get_replacement_mapper(
+        self.mapper = get_replacement_mapper(
             prompts, tokenizer, max_len=MAX_NUM_WORDS
         ).to(device)
 
@@ -466,7 +468,7 @@ class AttentionRefineWan(AttentionControlEditWan):
             prompts, num_steps, cross_replace_steps, self_replace_steps,
             local_blend, tokenizer, device, low_resource
         )
-        self.mapper, alphas = seq_aligner.get_refinement_mapper(
+        self.mapper, alphas = get_refinement_mapper(
             prompts, tokenizer, max_len=MAX_NUM_WORDS
         )
         self.mapper = self.mapper.to(device)
@@ -538,7 +540,7 @@ def get_equalizer_wan(
     values = torch.tensor(values, dtype=torch.float32)
 
     for word in word_select:
-        inds = ptp_utils_wan.get_word_inds_t5(text, word, tokenizer)
+        inds = get_word_inds_t5(text, word, tokenizer)
         if len(inds) > 0:
             equalizer[:, inds] = values.unsqueeze(1)
 
@@ -674,7 +676,7 @@ class LocalBlendWan:
             if isinstance(words_, str):
                 words_ = [words_]
             for word in words_:
-                ind = ptp_utils_wan.get_word_inds_t5(prompt, word, tokenizer)
+                ind = get_word_inds_t5(prompt, word, tokenizer)
                 if len(ind) > 0:
                     alpha_layers[i, :, :, :, ind] = 1
 
@@ -689,8 +691,9 @@ class LocalBlendWan:
 def aggregate_attention_wan(
     attention_store: AttentionStoreWan,
     prompts: List[str],
+    num_layers: int = 30,
     is_cross: bool = True,
-    select: int = 0,
+    prompt_idx: int = 0,
 ) -> Optional[torch.Tensor]:
     """
     Aggregate attention maps for visualization.
@@ -698,8 +701,9 @@ def aggregate_attention_wan(
     Args:
         attention_store: AttentionStoreWan instance
         prompts: List of prompts
+        num_layers: Number of layers to be selected (in total 30)
         is_cross: Whether to get cross or self attention
-        select: Which prompt to visualize
+        prompt_idx: Which prompt to visualize
 
     Returns:
         Aggregated attention tensor or None
@@ -711,22 +715,24 @@ def aggregate_attention_wan(
     if len(maps) == 0:
         return None
 
-    # Stack and average
+    # Stack over layers and average
     out = []
-    for item in maps:
+    for item in maps[:num_layers]:
         # item: [B*heads, seq_q, seq_kv]
         out.append(item)
 
     out = torch.stack(out, dim=0)  # [num_layers, B*heads, seq_q, seq_kv]
     out = out.mean(0)  # Average over layers: [B*heads, seq_q, seq_kv]
-
     # Split batch
     batch_size = len(prompts)
     heads = out.shape[0] // batch_size
-    out = out.reshape(batch_size, heads, out.shape[1], out.shape[2])
+    out = out.reshape(batch_size, heads, out.shape[1], out.shape[2]) # [B, heads, seq_q, seq_kv]
 
     # Select prompt and average over heads
-    out = out[select].mean(0)  # [seq_q, seq_kv]
+    out = out[prompt_idx].mean(0)  # [seq_q, seq_kv]
+
+    # seq_q further decomposes into t, h, w (latent dim.), averaged over t dim
+    out = out.reshape(5, 30, 52, -1).mean(0) # [t', h', w', seq_kv]
 
     return out
 
@@ -735,7 +741,7 @@ def show_cross_attention_video(
     attention_store: AttentionStoreWan,
     prompts: List[str],
     tokenizer,
-    select: int = 0,
+    prompt_idx: int = 0,
     num_tokens: int = 10,
     save_path: Optional[str] = None,
 ):
@@ -746,39 +752,30 @@ def show_cross_attention_video(
         attention_store: AttentionStoreWan instance
         prompts: List of prompts
         tokenizer: T5 tokenizer
-        select: Which prompt to visualize
+        prompt_idx: Which prompt to visualize
         num_tokens: Number of tokens to display
         save_path: Optional path to save figure
     """
-    attn = aggregate_attention_wan(attention_store, prompts, is_cross=True, select=select)
-
+    attn = aggregate_attention_wan(attention_store, prompts, is_cross=True, prompt_idx=prompt_idx)
+    print(f"6: {attn.shape}")
     if attn is None:
         print("No attention maps available")
         return
 
     # Encode prompt to get tokens
-    tokens = tokenizer.encode(prompts[select])[:num_tokens]
+    tokens = tokenizer.encode(prompts[prompt_idx])[:num_tokens]
 
-    # attn shape: [seq_patches, seq_text]
-    num_patches = attn.shape[0]
-
-    # Assume roughly square spatial arrangement
-    h = w = int(np.sqrt(num_patches))
-    if h * w != num_patches:
-        # Try to find factors
-        for i in range(int(np.sqrt(num_patches)), 0, -1):
-            if num_patches % i == 0:
-                h = i
-                w = num_patches // i
-                break
-
+    # attn: (h', w', num_tokens)
+    h = w = attn.shape[0:1]
+    
     fig, axes = plt.subplots(1, len(tokens), figsize=(len(tokens) * 2, 2))
 
     for i, token_id in enumerate(tokens):
         ax = axes[i] if len(tokens) > 1 else axes
 
         # Get attention for this token
-        token_attn = attn[:, i].reshape(h, w).cpu().numpy()
+        token_attn = attn[:, :, i]
+        token_attn = token_attn.unsqueeze(-1).expand(*token_attn.shape, 3).float().cpu().numpy()
         token_attn = token_attn / (token_attn.max() + 1e-8)
 
         ax.imshow(token_attn, cmap='hot')
@@ -853,7 +850,7 @@ def run_and_display_video(
         )
         print("Running with P2P...")
 
-    videos, x_t = ptp_utils_wan.text2video_wan(
+    videos, x_t = text2video_wan(
         model=model,
         prompt=prompts,
         controller=controller,
@@ -869,6 +866,6 @@ def run_and_display_video(
     )
 
     # Display frames
-    ptp_utils_wan.view_video_frames(videos)
+    view_video_frames(videos)
 
     return videos, x_t

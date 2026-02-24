@@ -25,8 +25,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
-import ptp_wan
-import ptp_utils_wan
+from ptp_wan import (
+    AttentionReplaceWan, AttentionRefineWan, AttentionReweightWan, AttentionStoreWan, LocalBlendWan,
+    show_cross_attention_video, run_and_display_video, get_equalizer_wan, load_wan_model
+)
+from ptp_utils_wan import export_video, view_video_frames, set_save_dir
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +50,7 @@ def make_controller(
 ):
     """Convenience factory for the different P2P controllers."""
     if kind == "replace":
-        return ptp_wan.AttentionReplaceWan(
+        return AttentionReplaceWan(
             prompts,
             num_steps=num_steps,
             cross_replace_steps=cross_replace_steps,
@@ -57,7 +60,7 @@ def make_controller(
             local_blend=local_blend,
         )
     elif kind == "refine":
-        return ptp_wan.AttentionRefineWan(
+        return AttentionRefineWan(
             prompts,
             num_steps=num_steps,
             cross_replace_steps=cross_replace_steps,
@@ -68,7 +71,7 @@ def make_controller(
         )
     elif kind == "reweight":
         assert equalizer is not None, "equalizer required for reweight"
-        return ptp_wan.AttentionReweightWan(
+        return AttentionReweightWan(
             prompts,
             num_steps=num_steps,
             cross_replace_steps=cross_replace_steps,
@@ -89,24 +92,32 @@ def save_outputs(videos, prompts, tag, output_dir, tokenizer, attention_store=No
 
         # Save mp4
         mp4_path = os.path.join(output_dir, f"{prefix}.mp4")
-        ptp_utils_wan.export_video(video, mp4_path)
-        print(f"  Saved video: {mp4_path}")
+        export_video(video, mp4_path)
+        print(f"Saved video: {mp4_path}")
 
         # Save frame grid
         grid_path = os.path.join(output_dir, f"{prefix}_frames.png")
-        ptp_utils_wan.view_video_frames(video, save_path=grid_path)
-        print(f"  Saved frames: {grid_path}")
+        view_video_frames(video, save_path=grid_path)
+        print(f"Saved frames: {grid_path}")
 
     if attention_store is not None:
-        attn_path = os.path.join(output_dir, f"{tag}_attention.png")
-        ptp_wan.show_cross_attention_video(
+        attn_path = os.path.join(output_dir, f"{tag}_attention_prompt0.png")
+        show_cross_attention_video(
             attention_store,
             prompts,
             tokenizer,
-            select=0,
+            prompt_idx=0,
             save_path=attn_path,
         )
-        print(f"  Saved attention: {attn_path}")
+        attn_path = os.path.join(output_dir, f"{tag}_attention_prompt1.png")
+        show_cross_attention_video(
+            attention_store,
+            prompts,
+            tokenizer,
+            prompt_idx=1,
+            save_path=attn_path,
+        )
+        print(f"Saved attention visualization")
 
 
 # ---------------------------------------------------------------------------
@@ -119,9 +130,9 @@ def example_cross_attention(model, tokenizer, device, args):
     prompts = ["A cat walking in the garden"]
 
     g = torch.Generator(device=device).manual_seed(args.seed)
-    controller = ptp_wan.AttentionStoreWan(low_resource=False)
+    controller = AttentionStoreWan(low_resource=False)
 
-    videos, latent = ptp_wan.run_and_display_video(
+    videos, latent = run_and_display_video(
         prompts,
         controller,
         model,
@@ -158,10 +169,10 @@ def example_replacement(model, tokenizer, device, args):
     ]
     controller = make_controller(
         "replace", prompts_animal, tokenizer, device, args.num_steps,
-        cross_replace_steps=0.8,
+        cross_replace_steps=1.0,
         self_replace_steps=0.4,
     )
-    videos, latent = ptp_wan.run_and_display_video(
+    videos, latent = run_and_display_video(
         prompts_animal,
         controller,
         model,
@@ -173,14 +184,14 @@ def example_replacement(model, tokenizer, device, args):
         width=args.width,
         offload=args.offload,
     )
-    save_outputs(videos, prompts_animal, "replace_cat_dog", args.output_dir, tokenizer)
+    save_outputs(videos, prompts_animal, "replace_cat_dog", args.output_dir, tokenizer, attention_store=controller)
 
     # --- Swap with LocalBlend: cat => dog ---
     prompts_scene = [
         "A cat walking in the garden",
         "A dog walking in the garden",
     ]
-    lb = ptp_wan.LocalBlendWan(
+    lb = LocalBlendWan(
         prompts_scene,
         words=[["cat"], ["dog"]],
         tokenizer=tokenizer,
@@ -189,11 +200,11 @@ def example_replacement(model, tokenizer, device, args):
     g = torch.Generator(device=device).manual_seed(args.seed)
     controller = make_controller(
         "replace", prompts_scene, tokenizer, device, args.num_steps,
-        cross_replace_steps=0.8,
+        cross_replace_steps=1.0,
         self_replace_steps=0.4,
         local_blend=lb,
     )
-    videos, latent = ptp_wan.run_and_display_video(
+    videos, latent = run_and_display_video(
         prompts_scene,
         controller,
         model,
@@ -225,7 +236,7 @@ def example_refinement(model, tokenizer, device, args):
         cross_replace_steps=0.8,
         self_replace_steps=0.4,
     )
-    videos, latent = ptp_wan.run_and_display_video(
+    videos, latent = run_and_display_video(
         prompts_adj,
         controller,
         model,
@@ -250,7 +261,7 @@ def example_refinement(model, tokenizer, device, args):
         cross_replace_steps=0.8,
         self_replace_steps=0.4,
     )
-    videos, latent = ptp_wan.run_and_display_video(
+    videos, latent = run_and_display_video(
         prompts_season,
         controller,
         model,
@@ -276,14 +287,14 @@ def example_reweight(model, tokenizer, device, args):
     prompts = [prompt, prompt]
 
     # Emphasize "red" (scale x5)
-    equalizer = ptp_wan.get_equalizer_wan(prompt, "red", (5.0,), tokenizer)
+    equalizer = get_equalizer_wan(prompt, "red", (5.0,), tokenizer)
     controller = make_controller(
         "reweight", prompts, tokenizer, device, args.num_steps,
         cross_replace_steps=0.8,
         self_replace_steps=0.4,
         equalizer=equalizer,
     )
-    videos, latent = ptp_wan.run_and_display_video(
+    videos, latent = run_and_display_video(
         prompts,
         controller,
         model,
@@ -299,14 +310,14 @@ def example_reweight(model, tokenizer, device, args):
 
     # De-emphasize "red" (scale x-5)
     g = torch.Generator(device=device).manual_seed(args.seed)
-    equalizer = ptp_wan.get_equalizer_wan(prompt, "red", (-5.0,), tokenizer)
+    equalizer = get_equalizer_wan(prompt, "red", (-5.0,), tokenizer)
     controller = make_controller(
         "reweight", prompts, tokenizer, device, args.num_steps,
         cross_replace_steps=0.8,
         self_replace_steps=0.4,
         equalizer=equalizer,
     )
-    videos, latent = ptp_wan.run_and_display_video(
+    videos, latent = run_and_display_video(
         prompts,
         controller,
         model,
@@ -401,7 +412,7 @@ def main():
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
-    ptp_utils_wan.set_save_dir(args.output_dir)
+    set_save_dir(args.output_dir)
 
     print(f"Output directory: {args.output_dir}")
     print(f"Steps: {args.num_steps}  Frames: {args.num_frames}  "
@@ -410,7 +421,7 @@ def main():
 
     # Load model
     print("\nLoading Wan2.1-T2V-1.3B model...")
-    model, tokenizer, device = ptp_wan.load_wan_model(enable_offload=args.offload)
+    model, tokenizer, device = load_wan_model(enable_offload=args.offload)
     print(f"Model loaded on {device}\n")
 
     # Run selected examples
